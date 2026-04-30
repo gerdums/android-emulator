@@ -1535,6 +1535,10 @@ function closeTransientMenu(origin) {
 
 function openEmuPanel(api) {
   ensureSidePanelVisible();
+  retryMountEmuPanel(api, Date.now());
+}
+
+function retryMountEmuPanel(api, startedAt) {
   setTimeout(() => {
     let mounted = false;
     try {
@@ -1542,14 +1546,20 @@ function openEmuPanel(api) {
     } catch (err) {
       api?.log?.error?.("android-emu mountEmuPanel threw", String(err?.stack || err));
     }
-    if (!mounted) api?.log?.warn?.("android-emu could not find side panel host");
-  }, 16);
+    if (mounted) return;
+    if (Date.now() - startedAt < 2500) {
+      ensureSidePanelVisible();
+      retryMountEmuPanel(api, startedAt);
+      return;
+    }
+    api?.log?.warn?.("android-emu could not find side panel host");
+  }, 80);
 }
 
 function mountEmuPanel(api) {
   const tablist = findRightTablist();
   if (!(tablist instanceof HTMLElement)) return false;
-  const panelHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
+  const panelHost = findPanelHostForTablist(tablist);
   if (!(panelHost instanceof HTMLElement)) return false;
   installNativeTabDeactivation(tablist, panelHost);
   installTablistDrag(tablist);
@@ -2052,22 +2062,103 @@ function deactivateEmuPanel(panelHost) {
 }
 
 function removeEmuPanel() {
-  const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
   if (panelHost instanceof HTMLElement) deactivateEmuPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
 }
 
 function ensureSidePanelVisible() {
-  if (findRightTablist()) return;
-  const toggle = document.querySelector('button[aria-label="Toggle side panel"][aria-pressed="false"]');
-  if (toggle instanceof HTMLElement) toggle.click();
+  if (findRightTablist()) return true;
+  const toggle = findSidePanelToggle();
+  if (!(toggle instanceof HTMLElement)) return false;
+  if (toggle.hasAttribute("disabled") || toggle.getAttribute("aria-disabled") === "true") {
+    return false;
+  }
+  if (toggle.getAttribute("aria-pressed") === "true") return false;
+  toggle.click();
+  return true;
 }
 
 function findRightTablist() {
-  const addButton = document.querySelector('button[aria-label="Open side panel tab"]');
-  const toolbar = addButton?.closest(".flex.h-toolbar-pane");
-  return toolbar?.querySelector('[role="tablist"]') || null;
+  const customTab = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
+  const existing = customTab?.closest('[role="tablist"]');
+  if (existing instanceof HTMLElement) return existing;
+
+  const addButton = findSidePanelAddButton();
+  const toolbar = addButton?.closest(".h-toolbar-pane");
+  const toolbarTablist = toolbar?.querySelector('[role="tablist"]');
+  if (toolbarTablist instanceof HTMLElement) return toolbarTablist;
+
+  const rightPanelTablist = document.querySelector(
+    '[data-app-shell-focus-area="right-panel"] [role="tablist"]',
+  );
+  if (rightPanelTablist instanceof HTMLElement) return rightPanelTablist;
+
+  for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+    if (!(tablist instanceof HTMLElement)) continue;
+    if (tablist.querySelector('[data-app-shell-tab-controller="right"]')) {
+      return tablist;
+    }
+  }
+
+  return null;
+}
+
+function findPanelHostForTablist(tablist) {
+  const oldHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
+  if (oldHost instanceof HTMLElement) return oldHost;
+
+  let node = tablist.parentElement;
+  while (node instanceof HTMLElement) {
+    if (node.getAttribute("data-app-shell-focus-area") === "right-panel") break;
+    try {
+      if (node.querySelector(':scope > [role="tabpanel"]')) return node;
+    } catch {}
+    node = node.parentElement;
+  }
+
+  const rightPanel = tablist.closest('[data-app-shell-focus-area="right-panel"]');
+  if (!(rightPanel instanceof HTMLElement)) return null;
+  const hosts = Array.from(rightPanel.querySelectorAll(".h-full.min-h-0.flex-col"));
+  return hosts.find((host) => host instanceof HTMLElement && host.contains(tablist)) || null;
+}
+
+function findSidePanelAddButton() {
+  return findButtonByLabel("Open side panel tab");
+}
+
+function findSidePanelToggle() {
+  return findButtonByLabel("Toggle side panel");
+}
+
+function findButtonByLabel(label) {
+  const escaped = cssEscape(label);
+  const exact = document.querySelector(
+    `button[aria-label="${escaped}"],button[title="${escaped}"],[role="button"][aria-label="${escaped}"],[role="button"][title="${escaped}"]`,
+  );
+  if (exact instanceof HTMLElement) return exact;
+
+  for (const el of document.querySelectorAll("button,[role='button']")) {
+    if (!(el instanceof HTMLElement)) continue;
+    if (getControlLabel(el) === label) return el;
+  }
+  return null;
+}
+
+function getControlLabel(el) {
+  return (
+    el.getAttribute("aria-label") ||
+    el.getAttribute("title") ||
+    compactText(el.textContent || "")
+  );
+}
+
+function cssEscape(value) {
+  if (globalThis.CSS?.escape) return globalThis.CSS.escape(value);
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 // toolbar handlers
