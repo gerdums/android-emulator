@@ -101,6 +101,8 @@ module.exports = {
   },
 
   installMenuEntries() {
+    wireNativeBrowserButtons();
+
     for (const browserButton of findBrowserMenuButtons()) {
       if (hasExistingMenuEntry(browserButton)) continue;
 
@@ -1908,6 +1910,47 @@ function findBrowserMenuButtons() {
   return Array.from(found);
 }
 
+function findNativeBrowserButtons() {
+  const found = new Set();
+  const candidates = Array.from(
+    document.querySelectorAll(
+      '[role="menuitem"], [role="menu"] button, [data-radix-popper-content-wrapper] button, [role="dialog"] button, [role="dialog"] [role="button"]',
+    ),
+  );
+
+  for (const node of candidates) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (isCustomMenuEntry(node)) continue;
+    if (!isMenuCandidate(node)) continue;
+    if (!isVisibleElement(node)) continue;
+    if (
+      matchesBrowserText(extractLabel(node)) ||
+      matchesBrowserText(compactText(node.textContent || ""))
+    ) {
+      found.add(node);
+    }
+  }
+
+  return Array.from(found);
+}
+
+function wireNativeBrowserButtons() {
+  for (const button of findNativeBrowserButtons()) {
+    if (button.__codexppAndroidEmuBrowserWired) continue;
+    button.__codexppAndroidEmuBrowserWired = true;
+    const prepare = (event) => {
+      if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+      prepareNativeSidebarAction();
+    };
+    button.addEventListener("pointerdown", prepare, true);
+    button.addEventListener("mousedown", prepare, true);
+    button.addEventListener("pointerup", prepare, true);
+    button.addEventListener("mouseup", prepare, true);
+    button.addEventListener("click", prepare, true);
+    button.addEventListener("keydown", prepare, true);
+  }
+}
+
 function findFallbackMenuButtons() {
   const found = new Set();
   const roots = Array.from(
@@ -2651,6 +2694,23 @@ function legacyPanelDisplayValue(panel) {
 
 function clearLegacyPanelDisplayAttrs(panel) {
   for (const attr of LEGACY_PANEL_PREV_DISPLAY_ATTRS) panel.removeAttribute(attr);
+}
+
+function prepareNativeSidebarAction() {
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
+  if (!(panelHost instanceof HTMLElement)) return;
+
+  for (const customTab of document.querySelectorAll(customTabSelector())) {
+    setSideTabSelected(customTab, false);
+  }
+  for (const customPanel of panelHost.querySelectorAll(customPanelSelector())) {
+    if (!(customPanel instanceof HTMLElement)) continue;
+    customPanel.style.display = "none";
+    detachPanelCapture(customPanel);
+  }
+  restoreNativePanels(panelHost);
 }
 
 function activateEmuPanel(panelHost, tab, panel) {
