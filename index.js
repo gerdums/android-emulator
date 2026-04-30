@@ -120,6 +120,7 @@ function registerMainHandlers(api, tweak) {
   const electron = require("electron");
   const { ipcMain, webContents } = electron;
   const fs = require("node:fs");
+  const http2 = require("node:http2");
   const net = require("node:net");
   const os = require("node:os");
   const path = require("node:path");
@@ -158,6 +159,14 @@ function registerMainHandlers(api, tweak) {
     screenshotDir: null,
     captureConsole: null,
     captureConsoleSerial: null,
+    grpcClient: null,
+    grpcSerial: null,
+    grpcPort: null,
+    grpcToken: null,
+    grpcTimer: null,
+    grpcBusy: false,
+    grpcFailures: 0,
+    grpcStreamSize: null,
     inputConsole: null,
     inputConsoleSerial: null,
     captureRestartTimer: null,
@@ -176,6 +185,14 @@ function registerMainHandlers(api, tweak) {
     displayCache: new Map(),
     emulatorProcs: new Map(),
   });
+  state.grpcClient ??= null;
+  state.grpcSerial ??= null;
+  state.grpcPort ??= null;
+  state.grpcToken ??= null;
+  state.grpcTimer ??= null;
+  state.grpcBusy ??= false;
+  state.grpcFailures ??= 0;
+  state.grpcStreamSize ??= null;
 
   function sdkRoots() {
     return [
@@ -649,6 +666,291 @@ function registerMainHandlers(api, tweak) {
     return { width, height };
   }
 
+  function targetGrpcStreamSize(size) {
+    if (!size?.width || !size?.height) return { width: 540, height: 1200 };
+    const width = Math.min(540, Math.max(360, Math.round(size.width / 2)));
+    const height = Math.max(1, Math.round((width * size.height) / size.width));
+    return { width, height };
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function encodeGrpcVarint(value) {
+    let v = BigInt(value);
+    const out = [];
+    while (v >= 128n) {
+      out.push(Number((v & 0x7fn) | 0x80n));
+      v >>= 7n;
+    }
+    out.push(Number(v));
+    return Buffer.from(out);
+  }
+
+  function encodeGrpcVarintField(field, value) {
+    return Buffer.concat([encodeGrpcVarint((field << 3) | 0), encodeGrpcVarint(value)]);
+  }
+
+  function encodeGrpcFrame(payload) {
+    const header = Buffer.alloc(5);
+    header[0] = 0;
+    header.writeUInt32BE(payload.length, 1);
+    return Buffer.concat([header, payload]);
+  }
+
+  function encodeImageFormat(format, width, height) {
+    return Buffer.concat([
+      encodeGrpcVarintField(1, format),
+      encodeGrpcVarintField(3, width),
+      encodeGrpcVarintField(4, height),
+    ]);
+  }
+
+  function readGrpcVarint(buffer, offset) {
+    let shift = 0n;
+    let value = 0n;
+    let pos = offset;
+    while (pos < buffer.length) {
+      const byte = buffer[pos++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return [Number(value), pos];
+      shift += 7n;
+    }
+    return null;
+  }
+
+  function parseGrpcImageFormat(buffer) {
+    const format = {};
+    let pos = 0;
+    while (pos < buffer.length) {
+      const tag = readGrpcVarint(buffer, pos);
+      if (!tag) break;
+      pos = tag[1];
+      const field = tag[0] >> 3;
+      const wire = tag[0] & 7;
+      if (wire === 0) {
+        const value = readGrpcVarint(buffer, pos);
+        if (!value) break;
+        if (field === 1) format.format = value[0];
+        else if (field === 3) format.width = value[0];
+        else if (field === 4) format.height = value[0];
+        pos = value[1];
+      } else if (wire === 2) {
+        const len = readGrpcVarint(buffer, pos);
+        if (!len) break;
+        pos = len[1] + len[0];
+      } else if (wire === 1) {
+        pos += 8;
+      } else if (wire === 5) {
+        pos += 4;
+      } else {
+        break;
+      }
+    }
+    return format;
+  }
+
+  function parseGrpcImage(buffer) {
+    const result = { format: null, image: null, seq: null };
+    let pos = 0;
+    while (pos < buffer.length) {
+      const tag = readGrpcVarint(buffer, pos);
+      if (!tag) break;
+      pos = tag[1];
+      const field = tag[0] >> 3;
+      const wire = tag[0] & 7;
+      if (wire === 0) {
+        const value = readGrpcVarint(buffer, pos);
+        if (!value) break;
+        if (field === 5) result.seq = value[0];
+        pos = value[1];
+      } else if (wire === 2) {
+        const len = readGrpcVarint(buffer, pos);
+        if (!len) break;
+        pos = len[1];
+        const end = pos + len[0];
+        if (field === 1) result.format = parseGrpcImageFormat(buffer.subarray(pos, end));
+        else if (field === 4) result.image = Buffer.from(buffer.subarray(pos, end));
+        pos = end;
+      } else if (wire === 1) {
+        pos += 8;
+      } else if (wire === 5) {
+        pos += 4;
+      } else {
+        break;
+      }
+    }
+    return result;
+  }
+
+  function parseIni(text) {
+    const out = {};
+    for (const raw of String(text || "").split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq < 0) continue;
+      out[line.slice(0, eq)] = line.slice(eq + 1).replace(/^"(.*)"$/, "$1");
+    }
+    return out;
+  }
+
+  function grpcDiscoveryDirs() {
+    return [
+      path.join(os.homedir(), "Library", "Caches", "TemporaryItems", "avd", "running"),
+      path.join(os.tmpdir(), "avd", "running"),
+      path.join(os.homedir(), ".android", "avd", "running"),
+    ];
+  }
+
+  function findGrpcDiscovery(serial, port) {
+    const consolePort = emulatorConsolePort(serial);
+    for (const dir of grpcDiscoveryDirs()) {
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of entries) {
+        if (!/^pid_.*\.ini$/.test(name)) continue;
+        const full = path.join(dir, name);
+        let info;
+        try {
+          info = parseIni(fs.readFileSync(full, "utf8"));
+        } catch {
+          continue;
+        }
+        if (consolePort && Number(info["port.serial"]) !== consolePort) continue;
+        if (port && Number(info["grpc.port"]) !== port) continue;
+        if (info["grpc.token"] && info["grpc.port"]) return info;
+      }
+    }
+    return null;
+  }
+
+  function closeGrpcClient() {
+    const client = state.grpcClient;
+    state.grpcClient = null;
+    state.grpcSerial = null;
+    state.grpcPort = null;
+    state.grpcToken = null;
+    if (client) {
+      try {
+        client.close();
+      } catch {}
+      try {
+        client.destroy();
+      } catch {}
+    }
+  }
+
+  async function ensureGrpcEndpoint(serial) {
+    const consolePort = emulatorConsolePort(serial);
+    if (!consolePort) return { ok: false, error: "not an emulator serial" };
+    const port = consolePort + 3000;
+    if (state.grpcSerial === serial && state.grpcPort === port && state.grpcToken) {
+      return { ok: true, port, token: state.grpcToken };
+    }
+
+    let started = await getCaptureConsole(serial).command(`grpc ${port}`, 1_000);
+    if (!started.ok) {
+      started = await run(adbPath, ["-s", serial, "emu", "grpc", String(port)], {
+        timeoutMs: 1_000,
+      });
+    }
+    if (!started.ok) {
+      return { ok: false, error: started.stderr || started.error || "gRPC endpoint unavailable" };
+    }
+
+    let info = null;
+    for (let i = 0; i < 6; i += 1) {
+      info = findGrpcDiscovery(serial, port);
+      if (info?.["grpc.token"]) break;
+      await delay(50);
+    }
+    if (!info?.["grpc.token"]) return { ok: false, error: "gRPC token not found" };
+    state.grpcSerial = serial;
+    state.grpcPort = port;
+    state.grpcToken = info["grpc.token"];
+    return { ok: true, port, token: state.grpcToken };
+  }
+
+  function ensureGrpcClient(serial, endpoint) {
+    if (
+      state.grpcClient &&
+      state.grpcSerial === serial &&
+      state.grpcPort === endpoint.port &&
+      !state.grpcClient.destroyed
+    ) {
+      return state.grpcClient;
+    }
+    closeGrpcClient();
+    const client = http2.connect(`http://127.0.0.1:${endpoint.port}`);
+    client.on("error", (e) => api.log?.warn?.("android-emu gRPC client error", String(e)));
+    state.grpcClient = client;
+    state.grpcSerial = serial;
+    state.grpcPort = endpoint.port;
+    state.grpcToken = endpoint.token;
+    return client;
+  }
+
+  function grpcUnary(serial, endpoint, method, payload, timeoutMs = 1_000) {
+    return new Promise((resolve) => {
+      const client = ensureGrpcClient(serial, endpoint);
+      const request = client.request({
+        ":method": "POST",
+        ":path": `/android.emulation.control.EmulatorController/${method}`,
+        "content-type": "application/grpc",
+        te: "trailers",
+        authorization: `Bearer ${endpoint.token}`,
+      });
+      let settled = false;
+      let buffer = Buffer.alloc(0);
+      let response = null;
+      let headerError = null;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          request.close();
+        } catch {}
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish({ ok: false, error: "gRPC request timed out" }), timeoutMs);
+      timer.unref?.();
+
+      request.on("response", (headers) => {
+        const status = headers["grpc-status"];
+        if (status && status !== "0") headerError = headers["grpc-message"] || `gRPC status ${status}`;
+      });
+      request.on("trailers", (headers) => {
+        const status = headers["grpc-status"];
+        if (status && status !== "0") headerError = headers["grpc-message"] || `gRPC status ${status}`;
+      });
+      request.on("data", (chunk) => {
+        buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
+        while (buffer.length >= 5) {
+          const len = buffer.readUInt32BE(1);
+          if (buffer.length < 5 + len) break;
+          response = Buffer.from(buffer.subarray(5, 5 + len));
+          buffer = buffer.subarray(5 + len);
+        }
+      });
+      request.on("error", (e) => {
+        closeGrpcClient();
+        finish({ ok: false, error: String(e) });
+      });
+      request.on("close", () => {
+        if (response) finish({ ok: true, data: response });
+        else finish({ ok: false, error: headerError || "empty gRPC response" });
+      });
+      request.end(encodeGrpcFrame(payload));
+    });
+  }
+
   function findJpegEnd(buffer, start) {
     for (let i = start + 2; i < buffer.length - 1; i += 1) {
       if (buffer[i] === 0xff && buffer[i + 1] === 0xd9) return i + 2;
@@ -790,6 +1092,124 @@ function registerMainHandlers(api, tweak) {
     broadcast(FRAME_CHANNEL, png);
     cleanupScreenshotDir(state.screenshotDir, file);
     return true;
+  }
+
+  async function captureGrpcScreenshotOnce(serial) {
+    const endpoint = await ensureGrpcEndpoint(serial);
+    if (!endpoint.ok) {
+      const error = endpoint.error || "gRPC endpoint unavailable";
+      if (state.lastError !== error) {
+        state.lastError = error;
+        sendStatus({ kind: "error", error });
+      }
+      return false;
+    }
+
+    const streamSize = state.grpcStreamSize || { width: 540, height: 1200 };
+    const res = await grpcUnary(
+      serial,
+      endpoint,
+      "getScreenshot",
+      encodeImageFormat(0, streamSize.width, streamSize.height),
+      900,
+    );
+    if (!res.ok) {
+      closeGrpcClient();
+      const error = res.error || "gRPC screenshot failed";
+      if (state.lastError !== error) {
+        state.lastError = error;
+        sendStatus({ kind: "error", error });
+      }
+      return false;
+    }
+
+    const image = parseGrpcImage(res.data);
+    if (!image.image?.length) return false;
+    state.lastError = null;
+    state.grpcFailures = 0;
+    broadcast(FRAME_CHANNEL, image.image);
+
+    const format = image.format || {};
+    if (format.width && format.height) {
+      const current = state.lastMeta || {};
+      if (
+        current.mode !== "grpc-png" ||
+        current.streamWidth !== format.width ||
+        current.streamHeight !== format.height
+      ) {
+        state.lastMeta = {
+          ...current,
+          serial,
+          streamWidth: format.width,
+          streamHeight: format.height,
+          mode: "grpc-png",
+        };
+        broadcast(META_CHANNEL, state.lastMeta);
+      }
+    }
+    return true;
+  }
+
+  async function startGrpcPngCapture(serial) {
+    const endpoint = await ensureGrpcEndpoint(serial);
+    if (!endpoint.ok) return endpoint;
+
+    state.serial = serial;
+    state.captureMode = "grpc-png";
+    state.captureStopping = false;
+    state.grpcFailures = 0;
+    state.lastFrameSentAt = 0;
+    const size = await getDisplaySize(serial).catch(() => ({ width: 1080, height: 2400 }));
+    const streamSize = targetGrpcStreamSize(size);
+    state.grpcStreamSize = streamSize;
+    state.lastMeta = {
+      serial,
+      width: size.width,
+      height: size.height,
+      streamWidth: streamSize.width,
+      streamHeight: streamSize.height,
+      mode: "grpc-png",
+    };
+    broadcast(META_CHANNEL, state.lastMeta);
+    sendStatus({ kind: "starting", message: "Starting emulator gRPC stream..." });
+
+    const tick = async () => {
+      if (state.captureMode !== "grpc-png" || state.captureStopping) return;
+      const started = Date.now();
+      if (!state.grpcBusy) {
+        state.grpcBusy = true;
+        try {
+          const ok = await captureGrpcScreenshotOnce(serial);
+          if (!ok) state.grpcFailures += 1;
+        } catch (e) {
+          state.grpcFailures += 1;
+          sendStatus({ kind: "error", error: String(e) });
+        } finally {
+          state.grpcBusy = false;
+        }
+      }
+
+      if (state.captureMode !== "grpc-png" || state.captureStopping) return;
+      if (state.grpcFailures >= 5) {
+        api.log?.warn?.("android-emu gRPC stream failed repeatedly; falling back to console screenshots");
+        if (state.grpcTimer) {
+          clearTimeout(state.grpcTimer);
+          state.grpcTimer = null;
+        }
+        state.captureMode = null;
+        closeGrpcClient();
+        startConsoleScreenshotCapture(serial).catch((e) =>
+          sendStatus({ kind: "error", error: String(e) }),
+        );
+        return;
+      }
+
+      const elapsed = Date.now() - started;
+      state.grpcTimer = setTimeout(tick, Math.max(1, 33 - elapsed));
+      state.grpcTimer.unref?.();
+    };
+    tick();
+    return { ok: true, status: "started", mode: "grpc-png", serial };
   }
 
   async function startConsoleScreenshotCapture(serial) {
@@ -1016,6 +1436,9 @@ function registerMainHandlers(api, tweak) {
     if (state.captureMode === "emulator-screenshot") {
       return { ok: true, status: "already-running", mode: "emulator-screenshot", serial: state.serial };
     }
+    if (state.captureMode === "grpc-png") {
+      return { ok: true, status: "already-running", mode: "grpc-png", serial: state.serial };
+    }
     if (state.captureMode === "screencap-loop" && state.screencapProc) {
       return { ok: true, status: "already-running", mode: "screencap-loop", serial: state.serial };
     }
@@ -1023,6 +1446,12 @@ function registerMainHandlers(api, tweak) {
       return { ok: true, status: "already-running", mode: "polling", serial: state.serial };
     }
     if (/^emulator-\d+$/.test(state.serial)) {
+      const grpc = await startGrpcPngCapture(state.serial).catch((e) => ({
+        ok: false,
+        error: String(e),
+      }));
+      if (grpc?.ok) return grpc;
+      api.log?.warn?.("android-emu gRPC capture unavailable; falling back to console screenshots", grpc?.error);
       return startConsoleScreenshotCapture(state.serial);
     }
     return startScreencapLoopCapture(state.serial);
@@ -1046,7 +1475,15 @@ function registerMainHandlers(api, tweak) {
       clearTimeout(state.screenshotTimer);
       state.screenshotTimer = null;
     }
+    if (state.grpcTimer) {
+      clearTimeout(state.grpcTimer);
+      state.grpcTimer = null;
+    }
     state.screenshotBusy = false;
+    state.grpcBusy = false;
+    state.grpcFailures = 0;
+    state.grpcStreamSize = null;
+    closeGrpcClient();
     if (state.captureTimer) {
       clearInterval(state.captureTimer);
       state.captureTimer = null;
@@ -1128,6 +1565,7 @@ function registerMainHandlers(api, tweak) {
 
   function schedulePendingMove(serial) {
     if (state.inputMoveTimer) return;
+    const delayMs = /^emulator-\d+$/.test(serial) ? 16 : 35;
     state.inputMoveTimer = setTimeout(() => {
       state.inputMoveTimer = null;
       const pending = state.pendingMove;
@@ -1147,7 +1585,7 @@ function registerMainHandlers(api, tweak) {
           );
         }
       }
-    }, 35);
+    }, delayMs);
     state.inputMoveTimer.unref?.();
   }
 
@@ -1186,7 +1624,7 @@ function registerMainHandlers(api, tweak) {
     if (event.phase === "move") {
       if (!state.touch) return { ok: true };
       if (pointDistance(state.touch.lastSent, point) < 4) return { ok: true };
-      if (now - (state.touch.lastMoveAt || 0) < 24) {
+      if (now - (state.touch.lastMoveAt || 0) < 16) {
         state.pendingMove = point;
         schedulePendingMove(serial);
         return { ok: true, throttled: true };
@@ -1679,7 +2117,9 @@ function createSideTab() {
 }
 
 function closeEmuTab() {
-  const panelHost = findRightTablist()?.closest(".flex.h-full.min-h-0.flex-col");
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
   if (panelHost instanceof HTMLElement) deactivateEmuPanel(panelHost);
   document.querySelector(`[${TWEAK_ATTR}="side-tab"]`)?.remove();
   document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`)?.remove();
@@ -1788,6 +2228,7 @@ function createPanel(api) {
 
   const mirror = document.createElement("img");
   mirror.alt = "Android Emulator";
+  mirror.decoding = "async";
   mirror.draggable = false;
   mirror.style.maxWidth = "100%";
   mirror.style.maxHeight = "100%";
@@ -1834,7 +2275,7 @@ function createPanel(api) {
   mirror.addEventListener("pointermove", (e) => {
     if (!pointerDown || e.pointerId !== activePointerId) return;
     const now = Date.now();
-    if (now - lastMoveSentAt < 30) return;
+    if (now - lastMoveSentAt < 16) return;
     lastMoveSentAt = now;
     const r = imgRatio(e);
     if (!r) return;
@@ -1871,21 +2312,35 @@ function createPanel(api) {
   panel.appendChild(content);
 
   let lastUrl = null;
-  const onFrame = (payload) => {
+  let queuedFrame = null;
+  let renderingFrame = false;
+  function renderNextFrame() {
+    if (renderingFrame || !queuedFrame) return;
+    const payload = queuedFrame;
+    queuedFrame = null;
     if (!payload) return;
     const u8 = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
     const isJpeg = u8[0] === 0xff && u8[1] === 0xd8;
     const url = URL.createObjectURL(new Blob([u8], { type: isJpeg ? "image/jpeg" : "image/png" }));
     const prev = lastUrl;
     lastUrl = url;
-    mirror.onload = () => {
+    renderingFrame = true;
+    const done = () => {
       if (prev) URL.revokeObjectURL(prev);
+      renderingFrame = false;
+      renderNextFrame();
     };
+    mirror.onload = done;
+    mirror.onerror = done;
     mirror.src = url;
     if (mirror.style.display === "none") {
       mirror.style.display = "";
       placeholder.style.display = "none";
     }
+  }
+  const onFrame = (payload) => {
+    queuedFrame = payload;
+    renderNextFrame();
   };
   const onMeta = (meta) => {
     panel.__codexppAndroidEmuMeta = meta;
@@ -1935,6 +2390,8 @@ function createPanel(api) {
       URL.revokeObjectURL(lastUrl);
       lastUrl = null;
     }
+    queuedFrame = null;
+    renderingFrame = false;
     mirror.removeAttribute("src");
     mirror.style.display = "none";
     placeholder.style.display = "";
