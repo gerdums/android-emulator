@@ -15,11 +15,20 @@
 
 const TWEAK_ATTR = "data-codexpp-android-emu";
 const OTHER_CUSTOM_PANEL_ATTRS = ["data-codexpp-ios-sim"];
+const CUSTOM_MENU_ATTRS = [TWEAK_ATTR, "data-codexpp-ios-sim"];
 const STYLE_ID = "codexpp-android-emu-style";
 const MENU_LABEL = "Android Emulator";
 const PANEL_LABEL = "Android Emulator";
 const BROWSER_PATTERNS = [/^browser$/i, /^browser use$/i, /\bbrowser\b/i];
 const PICKER_TITLE_PATTERNS = [/^new chat$/i, /^open file$/i, /^browse files$/i];
+const FALLBACK_MENU_TEXT_PATTERNS = [
+  /^\+?new chat\b/i,
+  /^open file\b/i,
+  /^browse files\b/i,
+  /^terminal\b/i,
+  /^review\b/i,
+  /^settings\b/i,
+];
 const PICKER_SUBTITLE = "Mirror an Android emulator in this pane";
 
 const ANDROID_SVG =
@@ -1850,6 +1859,7 @@ function findBrowserMenuButtons() {
     if (!(node instanceof HTMLElement)) continue;
     if (node.getAttribute(TWEAK_ATTR)) continue;
     if (!isMenuCandidate(node)) continue;
+    if (!isVisibleElement(node)) continue;
     if (
       matchesBrowserText(extractLabel(node)) ||
       matchesBrowserText(compactText(node.textContent || ""))
@@ -1866,6 +1876,7 @@ function findBrowserMenuButtons() {
     for (const row of rows) {
       if (!(row instanceof HTMLElement)) continue;
       if (row.getAttribute(TWEAK_ATTR)) continue;
+      if (!isVisibleElement(row)) continue;
       const title = compactText(
         row.querySelector("[data-codexpp-spitscreen-picker-title]")?.textContent ||
           row.querySelector("span")?.textContent ||
@@ -1877,6 +1888,35 @@ function findBrowserMenuButtons() {
         break;
       }
     }
+  }
+
+  if (found.size === 0) {
+    for (const fallback of findFallbackMenuButtons()) found.add(fallback);
+  }
+
+  return Array.from(found);
+}
+
+function findFallbackMenuButtons() {
+  const found = new Set();
+  const roots = Array.from(
+    document.querySelectorAll(
+      '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align], [role="dialog"]',
+    ),
+  );
+
+  for (const root of roots) {
+    if (!(root instanceof HTMLElement)) continue;
+    if (!isVisibleElement(root)) continue;
+    const candidates = Array.from(
+      root.querySelectorAll('[role="menuitem"], button, [role="button"]'),
+    ).filter(isFallbackMenuCandidate);
+    if (!candidates.length) continue;
+    const preferred =
+      candidates.find((node) =>
+        FALLBACK_MENU_TEXT_PATTERNS.some((pattern) => pattern.test(extractLabel(node))),
+      ) || candidates[0];
+    found.add(preferred);
   }
 
   return Array.from(found);
@@ -1897,6 +1937,27 @@ function isMenuCandidate(node) {
   return Boolean(
     node.closest('[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]'),
   );
+}
+
+function isFallbackMenuCandidate(node) {
+  if (!(node instanceof HTMLElement)) return false;
+  if (isCustomMenuEntry(node)) return false;
+  if (!isMenuCandidate(node)) return false;
+  if (!isVisibleElement(node)) return false;
+  if (node.matches("[disabled]") || node.getAttribute("aria-disabled") === "true") return false;
+  const text = extractLabel(node);
+  if (/^(close|dismiss|cancel|back)$/i.test(text)) return false;
+  return Boolean(text || node.querySelector("svg"));
+}
+
+function isCustomMenuEntry(node) {
+  return CUSTOM_MENU_ATTRS.some((attr) => Boolean(node.closest(`[${attr}]`)));
+}
+
+function isVisibleElement(node) {
+  const style = window.getComputedStyle?.(node);
+  if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+  return node.getClientRects().length > 0;
 }
 
 function rewriteMenuEntry(button) {
@@ -1933,7 +1994,41 @@ function rewriteMenuLabel(button) {
       break;
     }
   }
+  if (setTitle) {
+    removeShortcutHints(button);
+    return;
+  }
+
+  let setFallbackTitle = false;
+  const isPickerRow = Boolean(button.closest('[role="dialog"]'));
+  for (const node of textNodes) {
+    const text = compactText(node.nodeValue || "");
+    if (!isRewriteableMenuText(text)) continue;
+    if (!setFallbackTitle) {
+      node.nodeValue = MENU_LABEL;
+      setFallbackTitle = true;
+      if (!isPickerRow) break;
+      continue;
+    }
+    node.nodeValue = PICKER_SUBTITLE;
+    break;
+  }
+  if (setFallbackTitle) {
+    removeShortcutHints(button);
+    return;
+  }
+
+  const label = document.createElement("span");
+  label.textContent = MENU_LABEL;
+  button.appendChild(label);
   removeShortcutHints(button);
+}
+
+function isRewriteableMenuText(text) {
+  if (!text || text === MENU_LABEL) return false;
+  if (/^[⌘⇧⌥⌃^]+/.test(text) || /Cmd|Ctrl|Alt|Shift|⌘/.test(text)) return false;
+  if (!/[A-Za-z]/.test(text)) return false;
+  return true;
 }
 
 function rewriteMenuIcon(button) {
