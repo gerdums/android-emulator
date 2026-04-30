@@ -15,7 +15,13 @@
 
 const TWEAK_ATTR = "data-codexpp-android-emu";
 const OTHER_CUSTOM_PANEL_ATTRS = ["data-codexpp-ios-sim"];
+const CUSTOM_PANEL_ATTRS = [TWEAK_ATTR, ...OTHER_CUSTOM_PANEL_ATTRS];
 const CUSTOM_MENU_ATTRS = [TWEAK_ATTR, "data-codexpp-ios-sim"];
+const CUSTOM_PANEL_PREV_DISPLAY_ATTR = "data-codexpp-custom-panel-prev-display";
+const LEGACY_PANEL_PREV_DISPLAY_ATTRS = [
+  "data-codexpp-android-emu-prev-display",
+  "data-codexpp-ios-sim-prev-display",
+];
 const STYLE_ID = "codexpp-android-emu-style";
 const MENU_LABEL = "Android Emulator";
 const PANEL_LABEL = "Android Emulator";
@@ -104,7 +110,9 @@ module.exports = {
       rewriteMenuEntry(emuButton);
 
       const activate = (event) => {
+        if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
+        event.stopImmediatePropagation?.();
         event.stopPropagation();
         const now = Date.now();
         if (emuButton.__codexppLastActivate && now - emuButton.__codexppLastActivate < 400) return;
@@ -116,7 +124,10 @@ module.exports = {
 
       emuButton.addEventListener("pointerdown", activate, true);
       emuButton.addEventListener("mousedown", activate, true);
+      emuButton.addEventListener("pointerup", activate, true);
+      emuButton.addEventListener("mouseup", activate, true);
       emuButton.addEventListener("click", activate, true);
+      emuButton.addEventListener("keydown", activate, true);
       browserButton.insertAdjacentElement("afterend", emuButton);
     }
   },
@@ -2172,7 +2183,9 @@ function createSideTab() {
 
   button.append(iconSpan, close, labelSpan);
   button.addEventListener("click", () => {
-    const panelHost = controller.closest(".flex.h-full.min-h-0.flex-col");
+    const tablist = controller.closest('[role="tablist"]');
+    const panelHost =
+      tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
     const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
     if (panelHost instanceof HTMLElement && panel instanceof HTMLElement) {
       activateEmuPanel(panelHost, controller, panel);
@@ -2321,19 +2334,24 @@ function createPanel(api) {
   stage.className = "relative flex h-full w-full items-center justify-center";
   stage.style.padding = "24px 12px";
 
-  const mirror = document.createElement("img");
-  mirror.alt = "Android Emulator";
-  mirror.decoding = "async";
+  const mirror = document.createElement("canvas");
+  mirror.setAttribute("role", "img");
+  mirror.setAttribute("aria-label", "Android Emulator");
+  mirror.width = 1;
+  mirror.height = 1;
   mirror.draggable = false;
   mirror.style.maxWidth = "100%";
   mirror.style.maxHeight = "100%";
-  mirror.style.objectFit = "contain";
+  mirror.style.width = "auto";
+  mirror.style.height = "auto";
+  mirror.style.aspectRatio = "1 / 1";
   mirror.style.display = "none";
   mirror.style.userSelect = "none";
   mirror.style.touchAction = "none";
   mirror.style.borderRadius = "18px";
   mirror.style.boxShadow = "0 10px 40px rgba(0,0,0,0.35)";
   stage.appendChild(mirror);
+  const mirrorContext = mirror.getContext("2d", { alpha: false, desynchronized: true });
 
   let pointerDown = false;
   let activePointerId = null;
@@ -2406,31 +2424,64 @@ function createPanel(api) {
   panel.__codexppAndroidEmuStage = stage;
   panel.appendChild(content);
 
-  let lastUrl = null;
   let queuedFrame = null;
   let renderingFrame = false;
-  function renderNextFrame() {
+  let renderGeneration = 0;
+
+  function decodeFrameBlob(blob) {
+    if (typeof createImageBitmap === "function") return createImageBitmap(blob);
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      const url = URL.createObjectURL(blob);
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(image);
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("Android frame decode failed"));
+      };
+      image.src = url;
+    });
+  }
+
+  async function renderNextFrame() {
     if (renderingFrame || !queuedFrame) return;
     const payload = queuedFrame;
     queuedFrame = null;
     if (!payload) return;
+    const generation = renderGeneration;
     const u8 = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
     const isJpeg = u8[0] === 0xff && u8[1] === 0xd8;
-    const url = URL.createObjectURL(new Blob([u8], { type: isJpeg ? "image/jpeg" : "image/png" }));
-    const prev = lastUrl;
-    lastUrl = url;
     renderingFrame = true;
-    const done = () => {
-      if (prev) URL.revokeObjectURL(prev);
+    try {
+      if (!mirrorContext) throw new Error("Canvas rendering context unavailable");
+      const blob = new Blob([u8], { type: isJpeg ? "image/jpeg" : "image/png" });
+      const image = await decodeFrameBlob(blob);
+      if (generation !== renderGeneration) {
+        image.close?.();
+        return;
+      }
+      const width = image.width || image.naturalWidth;
+      const height = image.height || image.naturalHeight;
+      if (width > 0 && height > 0) {
+        if (mirror.width !== width || mirror.height !== height) {
+          mirror.width = width;
+          mirror.height = height;
+          mirror.style.aspectRatio = `${width} / ${height}`;
+        }
+        mirrorContext.drawImage(image, 0, 0, width, height);
+      }
+      image.close?.();
+      if (mirror.style.display === "none") {
+        mirror.style.display = "";
+        placeholder.style.display = "none";
+      }
+    } catch (e) {
+      setStatus(panel, "Frame decode failed: " + String(e?.message || e));
+    } finally {
       renderingFrame = false;
-      renderNextFrame();
-    };
-    mirror.onload = done;
-    mirror.onerror = done;
-    mirror.src = url;
-    if (mirror.style.display === "none") {
-      mirror.style.display = "";
-      placeholder.style.display = "none";
+      if (queuedFrame) requestAnimationFrame(() => renderNextFrame());
     }
   }
   const onFrame = (payload) => {
@@ -2445,12 +2496,16 @@ function createPanel(api) {
     if (!status) return;
     if (status.kind === "starting") setStatus(panel, status.message || "Starting Android capture...");
     else if (status.kind === "stopped") {
+      renderGeneration += 1;
+      queuedFrame = null;
       mirror.style.display = "none";
       placeholder.style.display = "";
       if (status.reason && status.reason !== "client-stop") {
         setStatus(panel, "Capture stopped: " + status.reason);
       }
     } else if (status.kind === "error") {
+      renderGeneration += 1;
+      queuedFrame = null;
       mirror.style.display = "none";
       placeholder.style.display = "";
       setStatus(panel, "Capture error: " + (status.error || "unknown"));
@@ -2481,13 +2536,13 @@ function createPanel(api) {
     }
     panel.__codexppAndroidEmuCaptureOff = null;
     api.ipc.invoke("android-emu:capture:stop").catch(() => {});
-    if (lastUrl) {
-      URL.revokeObjectURL(lastUrl);
-      lastUrl = null;
-    }
+    renderGeneration += 1;
     queuedFrame = null;
     renderingFrame = false;
-    mirror.removeAttribute("src");
+    mirrorContext?.clearRect(0, 0, mirror.width, mirror.height);
+    mirror.width = 1;
+    mirror.height = 1;
+    mirror.style.aspectRatio = "1 / 1";
     mirror.style.display = "none";
     placeholder.style.display = "";
   };
@@ -2523,33 +2578,94 @@ function makeToolbarButton({ label, icon, text, onClick }) {
   return b;
 }
 
-function isOtherCustomPanel(panel) {
-  return OTHER_CUSTOM_PANEL_ATTRS.some((attr) => panel.hasAttribute(attr));
+function customPanelSelector() {
+  return CUSTOM_PANEL_ATTRS.map((attr) => `[${attr}="tabpanel"]`).join(",");
+}
+
+function customTabSelector() {
+  return CUSTOM_PANEL_ATTRS.map((attr) => `[${attr}="side-tab"]`).join(",");
+}
+
+function isCustomPanel(panel) {
+  return CUSTOM_PANEL_ATTRS.some((attr) => panel.hasAttribute(attr));
+}
+
+function detachPanelCapture(panel) {
+  try {
+    panel.__codexppAndroidEmuDetachCapture?.();
+  } catch {}
+  try {
+    panel.__codexppIosSimDetachCapture?.();
+  } catch {}
+}
+
+function setSideTabSelected(tabWrap, selected) {
+  const tab = tabWrap?.querySelector?.('[role="tab"]');
+  if (selected) tabWrap?.setAttribute?.("data-selected", "true");
+  else tabWrap?.removeAttribute?.("data-selected");
+  tab?.setAttribute("aria-selected", selected ? "true" : "false");
+  tab?.classList.toggle("text-token-text-primary", selected);
+  tab?.classList.toggle("text-token-text-secondary", !selected);
+}
+
+function hidePanelsForCustomTab(panelHost, activePanel) {
+  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
+    if (nativePanel === activePanel) continue;
+    if (isCustomPanel(nativePanel)) {
+      nativePanel.style.display = "none";
+      detachPanelCapture(nativePanel);
+      continue;
+    }
+    if (!nativePanel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
+      nativePanel.setAttribute(
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(nativePanel) ?? nativePanel.style.display ?? "",
+      );
+    }
+    clearLegacyPanelDisplayAttrs(nativePanel);
+    nativePanel.style.display = "none";
+  }
+}
+
+function restoreNativePanels(panelHost) {
+  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
+    if (isCustomPanel(nativePanel)) continue;
+    const previous =
+      nativePanel.getAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR) ??
+      legacyPanelDisplayValue(nativePanel);
+    if (previous !== null) {
+      nativePanel.style.display = previous;
+      nativePanel.removeAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR);
+      clearLegacyPanelDisplayAttrs(nativePanel);
+    }
+  }
+}
+
+function legacyPanelDisplayValue(panel) {
+  for (const attr of LEGACY_PANEL_PREV_DISPLAY_ATTRS) {
+    const value = panel.getAttribute(attr);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function clearLegacyPanelDisplayAttrs(panel) {
+  for (const attr of LEGACY_PANEL_PREV_DISPLAY_ATTRS) panel.removeAttribute(attr);
 }
 
 function activateEmuPanel(panelHost, tab, panel) {
-  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
-    if (nativePanel === panel) continue;
-    if (!nativePanel.hasAttribute("data-codexpp-android-emu-prev-display")) {
-      nativePanel.setAttribute(
-        "data-codexpp-android-emu-prev-display",
-        nativePanel.style.display || "",
-      );
-    }
-    nativePanel.style.display = "none";
-  }
+  hidePanelsForCustomTab(panelHost, panel);
 
   for (const nativeTab of panelHost.querySelectorAll('[role="tab"]')) {
     nativeTab.setAttribute("aria-selected", "false");
     nativeTab.classList.remove("text-token-text-primary");
     nativeTab.classList.add("text-token-text-secondary");
   }
+  for (const customTab of document.querySelectorAll(customTabSelector())) {
+    if (customTab !== tab) setSideTabSelected(customTab, false);
+  }
 
-  const tabButton = tab.querySelector('[role="tab"]');
-  tab.dataset.selected = "true";
-  tabButton?.setAttribute("aria-selected", "true");
-  tabButton?.classList.remove("text-token-text-secondary");
-  tabButton?.classList.add("text-token-text-primary");
+  setSideTabSelected(tab, true);
   panel.style.display = "";
 
   const api = panel.__codexppAndroidEmuApi;
@@ -2590,27 +2706,13 @@ function activateEmuPanel(panelHost, tab, panel) {
 
 function deactivateEmuPanel(panelHost) {
   const tabWrap = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
-  const tab = tabWrap?.querySelector('[role="tab"]');
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
-  tabWrap?.removeAttribute("data-selected");
-  tab?.setAttribute("aria-selected", "false");
-  tab?.classList.remove("text-token-text-primary");
-  tab?.classList.add("text-token-text-secondary");
+  setSideTabSelected(tabWrap, false);
   if (panel instanceof HTMLElement) {
     panel.style.display = "none";
-    try {
-      panel.__codexppAndroidEmuDetachCapture?.();
-    } catch {}
+    detachPanelCapture(panel);
   }
-
-  for (const nativePanel of panelHost.querySelectorAll(':scope > [role="tabpanel"]')) {
-    if (nativePanel === panel || isOtherCustomPanel(nativePanel)) continue;
-    const previous = nativePanel.getAttribute("data-codexpp-android-emu-prev-display");
-    if (previous !== null) {
-      nativePanel.style.display = previous;
-      nativePanel.removeAttribute("data-codexpp-android-emu-prev-display");
-    }
-  }
+  restoreNativePanels(panelHost);
 }
 
 function removeEmuPanel() {
@@ -2660,22 +2762,31 @@ function findRightTablist() {
 }
 
 function findPanelHostForTablist(tablist) {
-  const oldHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
-  if (oldHost instanceof HTMLElement) return oldHost;
-
   let node = tablist.parentElement;
   while (node instanceof HTMLElement) {
-    if (node.getAttribute("data-app-shell-focus-area") === "right-panel") break;
     try {
       if (node.querySelector(':scope > [role="tabpanel"]')) return node;
     } catch {}
+    if (node.getAttribute("data-app-shell-focus-area") === "right-panel") break;
     node = node.parentElement;
+  }
+
+  const oldHost = tablist.closest(".flex.h-full.min-h-0.flex-col");
+  if (oldHost instanceof HTMLElement && oldHost.querySelector(':scope > [role="tabpanel"]')) {
+    return oldHost;
   }
 
   const rightPanel = tablist.closest('[data-app-shell-focus-area="right-panel"]');
   if (!(rightPanel instanceof HTMLElement)) return null;
   const hosts = Array.from(rightPanel.querySelectorAll(".h-full.min-h-0.flex-col"));
-  return hosts.find((host) => host instanceof HTMLElement && host.contains(tablist)) || null;
+  return (
+    hosts.find(
+      (host) =>
+        host instanceof HTMLElement &&
+        host.contains(tablist) &&
+        host.querySelector(':scope > [role="tabpanel"]'),
+    ) || null
+  );
 }
 
 function findSidePanelAddButton() {
