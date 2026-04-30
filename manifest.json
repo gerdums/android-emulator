@@ -1,0 +1,13 @@
+{
+  "id": "co.gerdums.android-emulator",
+  "name": "Android Emulator",
+  "version": "0.1.0",
+  "githubRepo": "gerdums/android-emulator",
+  "description": "Adds an Android Emulator tab to Codex's right panel. Mirrors a running or headless Android emulator through adb screencap and forwards taps, swipes, hardware buttons, and screenshots.",
+  "author": {
+    "name": "gerdums"
+  },
+  "tags": ["android", "emulator", "right-panel"],
+  "scope": "both",
+  "main": "index.js"
+}
