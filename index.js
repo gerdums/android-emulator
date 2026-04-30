@@ -6,9 +6,9 @@
  * - Native-looking right-panel tab + panel, parallel-injected like the iOS
  *   simulator tweak.
  * - Headless emulator launch through the Android SDK emulator.
- * - Frame capture through `adb exec-out screencap -p`.
- * - Pointer input through `adb shell input tap/swipe` and hardware buttons
- *   through Android keyevents.
+ * - Low-latency frame capture through `screenrecord` piped through ffmpeg.
+ * - Pointer input through a persistent `adb shell` so taps/drags do not pay
+ *   an adb process startup cost per event.
  */
 
 "use strict";
@@ -146,11 +146,23 @@ function registerMainHandlers(api, tweak) {
 
   const state = (globalThis.__codexppAndroidEmu = globalThis.__codexppAndroidEmu || {
     serial: null,
+    captureMode: null,
     captureTimer: null,
     captureBusy: false,
+    screenrecordProc: null,
+    ffmpegProc: null,
+    captureRestartTimer: null,
+    captureStopping: false,
+    jpegBuffer: Buffer.alloc(0),
+    lastFrameSentAt: 0,
     lastMeta: null,
     lastError: null,
     touch: null,
+    inputShellProc: null,
+    inputShellSerial: null,
+    inputBusy: false,
+    pendingMove: null,
+    inputMoveTimer: null,
     displayCache: new Map(),
     emulatorProcs: new Map(),
   });
@@ -178,6 +190,7 @@ function registerMainHandlers(api, tweak) {
 
   const adbPath = findTool("adb", ["platform-tools"]);
   const emulatorPath = findTool("emulator", ["emulator"]);
+  const ffmpegPath = findTool("ffmpeg", []);
 
   function broadcast(channel, ...args) {
     try {
@@ -468,6 +481,186 @@ function registerMainHandlers(api, tweak) {
     }
   }
 
+  function targetStreamSize(size) {
+    if (!size?.width || !size?.height) return { width: 540, height: 1200 };
+    const targetWidth = Math.min(720, Math.max(360, Math.round(size.width / 2)));
+    const width = targetWidth % 2 === 0 ? targetWidth : targetWidth - 1;
+    const rawHeight = Math.round((width * size.height) / size.width);
+    const height = rawHeight % 2 === 0 ? rawHeight : rawHeight + 1;
+    return { width, height };
+  }
+
+  function findJpegEnd(buffer, start) {
+    for (let i = start + 2; i < buffer.length - 1; i += 1) {
+      if (buffer[i] === 0xff && buffer[i + 1] === 0xd9) return i + 2;
+    }
+    return -1;
+  }
+
+  function processJpegStream(chunk) {
+    state.jpegBuffer = state.jpegBuffer.length ? Buffer.concat([state.jpegBuffer, chunk]) : chunk;
+    for (;;) {
+      let start = -1;
+      for (let i = 0; i < state.jpegBuffer.length - 1; i += 1) {
+        if (state.jpegBuffer[i] === 0xff && state.jpegBuffer[i + 1] === 0xd8) {
+          start = i;
+          break;
+        }
+      }
+      if (start < 0) {
+        if (state.jpegBuffer.length > 1_000_000) state.jpegBuffer = Buffer.alloc(0);
+        return;
+      }
+      if (start > 0) state.jpegBuffer = state.jpegBuffer.subarray(start);
+      const end = findJpegEnd(state.jpegBuffer, 0);
+      if (end < 0) {
+        if (state.jpegBuffer.length > 8_000_000) state.jpegBuffer = Buffer.alloc(0);
+        return;
+      }
+      const frame = Buffer.from(state.jpegBuffer.subarray(0, end));
+      state.jpegBuffer = state.jpegBuffer.subarray(end);
+      const now = Date.now();
+      if (now - state.lastFrameSentAt < 45) continue;
+      state.lastFrameSentAt = now;
+      broadcast(FRAME_CHANNEL, frame);
+    }
+  }
+
+  async function startStreamCapture(serial) {
+    const size = await getDisplaySize(serial).catch(() => ({ width: 1080, height: 2400 }));
+    const streamSize = targetStreamSize(size);
+    state.lastMeta = {
+      serial,
+      width: size.width,
+      height: size.height,
+      streamWidth: streamSize.width,
+      streamHeight: streamSize.height,
+      mode: "screenrecord",
+    };
+    broadcast(META_CHANNEL, state.lastMeta);
+
+    state.captureStopping = false;
+    state.jpegBuffer = Buffer.alloc(0);
+    state.lastFrameSentAt = 0;
+    sendStatus({ kind: "starting", message: "Starting low-latency Android stream..." });
+
+    const adbArgs = [
+      "-s", serial,
+      "exec-out",
+      "screenrecord",
+      "--output-format=h264",
+      "--bit-rate", "2500000",
+      "--size", `${streamSize.width}x${streamSize.height}`,
+      "--time-limit", "180",
+      "-",
+    ];
+    const ffmpegArgs = [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-fflags", "+genpts",
+      "-r", "25",
+      "-f", "h264",
+      "-i", "pipe:0",
+      "-f", "image2pipe",
+      "-c:v", "mjpeg",
+      "-q:v", "6",
+      "pipe:1",
+    ];
+
+    const adbProc = spawn(adbPath, adbArgs, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    const ffmpegProc = spawn(ffmpegPath, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+    state.screenrecordProc = adbProc;
+    state.ffmpegProc = ffmpegProc;
+    state.captureMode = "screenrecord";
+
+    adbProc.stdout.pipe(ffmpegProc.stdin);
+    adbProc.stdout.on("error", () => {});
+    ffmpegProc.stdin.on("error", () => {});
+    adbProc.stderr.on("data", (b) => {
+      const line = b.toString("utf8").trim();
+      if (line) api.log?.info?.("[android-screenrecord]", line);
+    });
+    ffmpegProc.stderr.on("data", (b) => {
+      const line = b.toString("utf8").trim();
+      if (line) api.log?.info?.("[android-ffmpeg]", line);
+    });
+    ffmpegProc.stdout.on("data", processJpegStream);
+
+    const failToPolling = (source, err) => {
+      if (state.captureStopping) return;
+      api.log?.warn?.("android-emu stream failed", { source, error: String(err || "") });
+      stopStreamCapture();
+      startPollingCapture(serial, "stream-fallback").catch((e) =>
+        sendStatus({ kind: "error", error: String(e) }),
+      );
+    };
+
+    adbProc.on("error", (e) => failToPolling("adb", e));
+    ffmpegProc.on("error", (e) => failToPolling("ffmpeg", e));
+    adbProc.on("exit", (code, signal) => {
+      if (state.captureStopping) return;
+      api.log?.info?.("android-emu screenrecord exit", { code, signal });
+      scheduleStreamRestart(serial);
+    });
+    ffmpegProc.on("exit", (code, signal) => {
+      if (state.captureStopping) return;
+      api.log?.info?.("android-emu ffmpeg exit", { code, signal });
+      scheduleStreamRestart(serial);
+    });
+
+    return { ok: true, status: "started", mode: "screenrecord", serial };
+  }
+
+  function scheduleStreamRestart(serial) {
+    if (state.captureRestartTimer || state.captureMode !== "screenrecord") return;
+    state.captureRestartTimer = setTimeout(() => {
+      state.captureRestartTimer = null;
+      if (state.captureStopping || state.captureMode !== "screenrecord") return;
+      stopStreamCapture({ keepMode: true });
+      startStreamCapture(serial).catch((e) => {
+        api.log?.warn?.("android-emu stream restart failed", String(e));
+        startPollingCapture(serial, "stream-restart-fallback").catch(() => {});
+      });
+    }, 400);
+    state.captureRestartTimer.unref?.();
+  }
+
+  async function startPollingCapture(serial, reason) {
+    state.serial = serial;
+    state.captureMode = "polling";
+    if (state.captureTimer) return { ok: true, status: "already-running", mode: "polling", serial };
+    sendStatus({
+      kind: "starting",
+      message: reason ? "Falling back to screencap polling..." : "Starting Android capture...",
+    });
+    state.captureTimer = setInterval(() => captureOnce(), 250);
+    state.captureTimer.unref?.();
+    captureOnce();
+    return { ok: true, status: "started", mode: "polling", serial };
+  }
+
+  function stopStreamCapture(opts = {}) {
+    state.captureStopping = true;
+    if (state.captureRestartTimer) {
+      clearTimeout(state.captureRestartTimer);
+      state.captureRestartTimer = null;
+    }
+    const procs = [state.screenrecordProc, state.ffmpegProc];
+    state.screenrecordProc = null;
+    state.ffmpegProc = null;
+    state.jpegBuffer = Buffer.alloc(0);
+    for (const proc of procs) {
+      if (!proc || proc.killed) continue;
+      try {
+        proc.removeAllListeners("exit");
+        proc.removeAllListeners("error");
+        proc.kill("SIGTERM");
+      } catch {}
+    }
+    if (!opts.keepMode && state.captureMode === "screenrecord") state.captureMode = null;
+    state.captureStopping = false;
+  }
+
   function normalizePng(buffer) {
     if (buffer?.[0] === 0x89 && buffer?.[1] === 0x50) return Buffer.from(buffer);
     return Buffer.from(String(buffer).replace(/\r\n/g, "\n"), "binary");
@@ -483,25 +676,126 @@ function registerMainHandlers(api, tweak) {
       sendStatus({ kind: "stopped", reason: "No running Android emulator" });
       return { ok: false, error: "No running Android emulator" };
     }
-    if (state.captureTimer) return { ok: true, status: "already-running", serial: state.serial };
-    sendStatus({ kind: "starting", message: "Starting Android capture..." });
-    state.captureTimer = setInterval(() => captureOnce(), 550);
-    state.captureTimer.unref?.();
-    captureOnce();
-    return { ok: true, status: "started", serial: state.serial };
+    if (state.captureMode === "screenrecord" && state.screenrecordProc && state.ffmpegProc) {
+      return { ok: true, status: "already-running", mode: "screenrecord", serial: state.serial };
+    }
+    if (state.captureTimer) {
+      return { ok: true, status: "already-running", mode: "polling", serial: state.serial };
+    }
+    if (/^emulator-\d+$/.test(state.serial) && ffmpegPath && ffmpegPath !== "ffmpeg") {
+      return startStreamCapture(state.serial);
+    }
+    return startPollingCapture(state.serial);
   }
 
   function stopCapture(reason) {
+    stopStreamCapture();
     if (state.captureTimer) {
       clearInterval(state.captureTimer);
       state.captureTimer = null;
     }
     state.captureBusy = false;
+    state.captureMode = null;
     if (reason) sendStatus({ kind: "stopped", reason });
   }
 
+  function stopInputShell() {
+    if (state.inputMoveTimer) {
+      clearTimeout(state.inputMoveTimer);
+      state.inputMoveTimer = null;
+    }
+    state.pendingMove = null;
+    state.touch = null;
+    const proc = state.inputShellProc;
+    state.inputShellProc = null;
+    state.inputShellSerial = null;
+    if (proc && !proc.killed) {
+      try {
+        proc.kill("SIGTERM");
+      } catch {}
+    }
+  }
+
+  function ensureInputShell(serial) {
+    if (state.inputShellProc && !state.inputShellProc.killed && state.inputShellSerial === serial) {
+      return { ok: true };
+    }
+    stopInputShell();
+    const proc = spawn(adbPath, ["-s", serial, "shell"], {
+      stdio: ["pipe", "ignore", "pipe"],
+      env: process.env,
+    });
+    proc.stderr.on("data", (b) => {
+      const line = b.toString("utf8").trim();
+      if (line) api.log?.info?.("[android-input]", line);
+    });
+    proc.on("error", (e) => {
+      api.log?.warn?.("android-emu input shell error", String(e));
+      if (state.inputShellProc === proc) stopInputShell();
+    });
+    proc.on("exit", (code, signal) => {
+      api.log?.info?.("android-emu input shell exit", { code, signal });
+      if (state.inputShellProc === proc) {
+        state.inputShellProc = null;
+        state.inputShellSerial = null;
+      }
+    });
+    state.inputShellProc = proc;
+    state.inputShellSerial = serial;
+    return { ok: true };
+  }
+
+  function safeInputArgs(args) {
+    return args.map((arg) => String(arg).replace(/[^A-Za-z0-9_.:-]/g, ""));
+  }
+
   async function runShellInput(serial, args) {
-    return runAdb(["-s", serial, "shell", "input", ...args.map(String)], { timeoutMs: 8_000 });
+    const ready = ensureInputShell(serial);
+    if (!ready.ok) return ready;
+    try {
+      state.inputShellProc.stdin.write("input " + safeInputArgs(args).join(" ") + "\n");
+      return { ok: true };
+    } catch (e) {
+      stopInputShell();
+      return { ok: false, error: String(e) };
+    }
+  }
+
+  function pointDistance(a, b) {
+    if (!a || !b) return Infinity;
+    return Math.hypot((b.x || 0) - (a.x || 0), (b.y || 0) - (a.y || 0));
+  }
+
+  function schedulePendingMove(serial) {
+    if (state.inputMoveTimer) return;
+    state.inputMoveTimer = setTimeout(() => {
+      state.inputMoveTimer = null;
+      const pending = state.pendingMove;
+      state.pendingMove = null;
+      if (pending && state.touch) {
+        sendMoveSegment(serial, pending).catch((e) =>
+          api.log?.warn?.("android-emu pending move failed", String(e)),
+        );
+      }
+    }, 35);
+    state.inputMoveTimer.unref?.();
+  }
+
+  async function sendMoveSegment(serial, point) {
+    const touch = state.touch;
+    if (!touch) return { ok: true };
+    const from = touch.lastSent || touch.start;
+    if (pointDistance(from, point) < 8) return { ok: true };
+    const now = Date.now();
+    if (now - (touch.lastMoveAt || 0) < 35) {
+      state.pendingMove = point;
+      schedulePendingMove(serial);
+      return { ok: true, throttled: true };
+    }
+    touch.lastSent = point;
+    touch.lastMoveAt = now;
+    touch.moved = true;
+    return runShellInput(serial, ["swipe", from.x, from.y, point.x, point.y, 45]);
   }
 
   ipcMain.handle(ch("android-emu:input:event"), async (_evt, event) => {
@@ -525,25 +819,34 @@ function registerMainHandlers(api, tweak) {
     };
 
     if (event.phase === "down") {
-      state.touch = { start: point, last: point };
+      state.touch = { start: point, last: point, lastSent: point, lastMoveAt: 0, moved: false };
+      state.pendingMove = null;
       return { ok: true };
     }
     if (event.phase === "move") {
       if (state.touch) state.touch.last = point;
-      return { ok: true };
+      return sendMoveSegment(serial, point);
     }
     if (event.phase === "up") {
       const start = state.touch?.start || point;
+      const lastSent = state.touch?.lastSent || start;
+      const moved = state.touch?.moved || pointDistance(start, point) >= 12;
       state.touch = null;
+      state.pendingMove = null;
+      if (state.inputMoveTimer) {
+        clearTimeout(state.inputMoveTimer);
+        state.inputMoveTimer = null;
+      }
       const dx = point.x - start.x;
       const dy = point.y - start.y;
       const distance = Math.hypot(dx, dy);
-      if (distance < 12) {
+      if (!moved && distance < 12) {
         const r = await runShellInput(serial, ["tap", point.x, point.y]);
         return { ok: r.ok, error: r.stderr || r.error };
       }
-      const duration = Math.max(80, Math.min(1500, point.at - start.at));
-      const r = await runShellInput(serial, ["swipe", start.x, start.y, point.x, point.y, duration]);
+      const r = pointDistance(lastSent, point) >= 6
+        ? await runShellInput(serial, ["swipe", lastSent.x, lastSent.y, point.x, point.y, 45])
+        : { ok: true };
       return { ok: r.ok, error: r.stderr || r.error };
     }
 
@@ -619,6 +922,7 @@ function registerMainHandlers(api, tweak) {
 
   tweak.removeMainHandlers = () => {
     stopCapture();
+    stopInputShell();
     for (const c of channels) {
       try {
         ipcMain.removeHandler(c);
@@ -1072,6 +1376,7 @@ function createPanel(api) {
 
   let pointerDown = false;
   let activePointerId = null;
+  let lastMoveSentAt = 0;
   function imgRatio(evt) {
     const rect = mirror.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
@@ -1094,6 +1399,7 @@ function createPanel(api) {
     if (!r) return;
     pointerDown = true;
     activePointerId = e.pointerId;
+    lastMoveSentAt = 0;
     try {
       mirror.setPointerCapture(e.pointerId);
     } catch {}
@@ -1102,6 +1408,9 @@ function createPanel(api) {
   });
   mirror.addEventListener("pointermove", (e) => {
     if (!pointerDown || e.pointerId !== activePointerId) return;
+    const now = Date.now();
+    if (now - lastMoveSentAt < 30) return;
+    lastMoveSentAt = now;
     const r = imgRatio(e);
     if (!r) return;
     send({ type: "touch", phase: "move", x: r.x, y: r.y });
@@ -1140,7 +1449,8 @@ function createPanel(api) {
   const onFrame = (payload) => {
     if (!payload) return;
     const u8 = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-    const url = URL.createObjectURL(new Blob([u8], { type: "image/png" }));
+    const isJpeg = u8[0] === 0xff && u8[1] === 0xd8;
+    const url = URL.createObjectURL(new Blob([u8], { type: isJpeg ? "image/jpeg" : "image/png" }));
     const prev = lastUrl;
     lastUrl = url;
     mirror.onload = () => {
