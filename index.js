@@ -18,6 +18,8 @@ const OTHER_CUSTOM_PANEL_ATTRS = ["data-codexpp-ios-sim"];
 const CUSTOM_PANEL_ATTRS = [TWEAK_ATTR, ...OTHER_CUSTOM_PANEL_ATTRS];
 const CUSTOM_MENU_ATTRS = [TWEAK_ATTR, "data-codexpp-ios-sim"];
 const CUSTOM_PANEL_PREV_DISPLAY_ATTR = "data-codexpp-custom-panel-prev-display";
+const CUSTOM_PANEL_HOST_ATTR = "data-codexpp-custom-panel-host";
+const ACTIVE_CUSTOM_PANEL_ATTR = "data-codexpp-active-custom-panel";
 const LEGACY_PANEL_PREV_DISPLAY_ATTRS = [
   "data-codexpp-android-emu-prev-display",
   "data-codexpp-ios-sim-prev-display",
@@ -79,8 +81,16 @@ module.exports = {
 
     await api.react.waitForElement?.("body", 10_000);
 
-    this.observer = new MutationObserver(() => this.installMenuEntries());
-    this.observer.observe(document.body, { childList: true, subtree: true });
+    this.observer = new MutationObserver(() => {
+      this.installMenuEntries();
+      reconcileActiveCustomPanelFromDom();
+    });
+    this.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-selected", "class", "data-selected", "style"],
+    });
     this.cleanup.push(() => this.observer?.disconnect());
 
     this.installMenuEntries();
@@ -1825,6 +1835,35 @@ function injectStyles() {
     [${TWEAK_ATTR}="tabpanel"] {
       background: var(--color-background-panel, var(--color-token-bg-fog));
     }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel] > :not(:first-child):not(.h-toolbar):not([role="status"]):not([data-codexpp-ios-sim="tabpanel"]):not([data-codexpp-android-emu="tabpanel"]) {
+      display: none !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel] > [role="tabpanel"]:not([data-codexpp-ios-sim="tabpanel"]):not([data-codexpp-android-emu="tabpanel"]) {
+      display: none !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-ios-sim"] > [data-codexpp-ios-sim="tabpanel"],
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-android-emu"] > [data-codexpp-android-emu="tabpanel"] {
+      display: flex !important;
+    }
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-ios-sim"] > [data-codexpp-android-emu="tabpanel"],
+    [${CUSTOM_PANEL_HOST_ATTR}][data-codexpp-active-custom-panel="data-codexpp-android-emu"] > [data-codexpp-ios-sim="tabpanel"] {
+      display: none !important;
+    }
+    body[${ACTIVE_CUSTOM_PANEL_ATTR}] [data-browser-sidebar-webview] {
+      height: 1px !important;
+      left: -10000px !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      top: 0 !important;
+      visibility: hidden !important;
+      width: 1px !important;
+      z-index: -1 !important;
+    }
+    body[${ACTIVE_CUSTOM_PANEL_ATTR}] [data-browser-sidebar-webview] > webview {
+      opacity: 0 !important;
+      pointer-events: none !important;
+      visibility: hidden !important;
+    }
     [${TWEAK_ATTR}="toolbar-button"] {
       display: inline-flex;
       align-items: center;
@@ -1873,6 +1912,8 @@ function findBrowserMenuButtons() {
     if (node.getAttribute(TWEAK_ATTR)) continue;
     if (!isMenuCandidate(node)) continue;
     if (!isVisibleElement(node)) continue;
+    const menuRoot = closestFloatingMenuRoot(node);
+    if (!(menuRoot instanceof HTMLElement) || !isSidePanelAddMenuRoot(menuRoot)) continue;
     if (
       matchesBrowserText(extractLabel(node)) ||
       matchesBrowserText(compactText(node.textContent || ""))
@@ -1955,13 +1996,14 @@ function findFallbackMenuButtons() {
   const found = new Set();
   const roots = Array.from(
     document.querySelectorAll(
-      '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align], [role="dialog"]',
+      '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]',
     ),
   );
 
   for (const root of roots) {
     if (!(root instanceof HTMLElement)) continue;
     if (!isVisibleElement(root)) continue;
+    if (!isSidePanelAddMenuRoot(root)) continue;
     const candidates = Array.from(
       root.querySelectorAll('[role="menuitem"], button, [role="button"]'),
     ).filter(isFallbackMenuCandidate);
@@ -1974,6 +2016,31 @@ function findFallbackMenuButtons() {
   }
 
   return Array.from(found);
+}
+
+function closestFloatingMenuRoot(node) {
+  if (!(node instanceof HTMLElement)) return null;
+  return node.closest(
+    '[role="menu"], [data-radix-popper-content-wrapper], [data-side][data-align]',
+  );
+}
+
+function isSidePanelAddMenuRoot(root) {
+  if (!(root instanceof HTMLElement)) return false;
+  const addButton = findSidePanelAddButton();
+  if (!(addButton instanceof HTMLElement)) return false;
+
+  const rootRect = root.getBoundingClientRect();
+  const addRect = addButton.getBoundingClientRect();
+  if (!rootRect.width || !rootRect.height || !addRect.width || !addRect.height) return false;
+
+  const addCenterX = addRect.left + addRect.width / 2;
+  const horizontallyAnchored =
+    rootRect.left <= addCenterX + 80 && rootRect.right >= addCenterX - 80;
+  const verticallyAnchored =
+    rootRect.top <= addRect.bottom + 360 && rootRect.bottom >= addRect.top - 24;
+
+  return horizontallyAnchored && verticallyAnchored;
 }
 
 function hasExistingMenuEntry(origin) {
@@ -2310,7 +2377,7 @@ function installNativeTabDeactivation(tablist, panelHost) {
     const target = event.target instanceof Element ? event.target : null;
     const tab = target?.closest?.('[role="tab"]');
     if (!(tab instanceof HTMLElement)) return;
-    if (tab.closest(`[${TWEAK_ATTR}="side-tab"]`)) return;
+    if (tab.closest(customTabSelector())) return;
     deactivateEmuPanel(panelHost);
   };
 
@@ -2701,6 +2768,7 @@ function prepareNativeSidebarAction() {
   const panelHost =
     tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
   if (!(panelHost instanceof HTMLElement)) return;
+  clearActiveCustomPanelFlag(panelHost);
 
   for (const customTab of document.querySelectorAll(customTabSelector())) {
     setSideTabSelected(customTab, false);
@@ -2714,6 +2782,7 @@ function prepareNativeSidebarAction() {
 }
 
 function activateEmuPanel(panelHost, tab, panel) {
+  deactivateNativeBrowserSurface(panelHost);
   hidePanelsForCustomTab(panelHost, panel);
 
   for (const nativeTab of panelHost.querySelectorAll('[role="tab"]')) {
@@ -2727,6 +2796,7 @@ function activateEmuPanel(panelHost, tab, panel) {
 
   setSideTabSelected(tab, true);
   panel.style.display = "";
+  scheduleCustomPanelReconcile(panelHost);
 
   const api = panel.__codexppAndroidEmuApi;
   if (!api) return;
@@ -2765,6 +2835,7 @@ function activateEmuPanel(panelHost, tab, panel) {
 }
 
 function deactivateEmuPanel(panelHost) {
+  clearActiveCustomPanelFlag(panelHost);
   const tabWrap = document.querySelector(`[${TWEAK_ATTR}="side-tab"]`);
   const panel = document.querySelector(`[${TWEAK_ATTR}="tabpanel"]`);
   setSideTabSelected(tabWrap, false);
@@ -2773,6 +2844,146 @@ function deactivateEmuPanel(panelHost) {
     detachPanelCapture(panel);
   }
   restoreNativePanels(panelHost);
+}
+
+function rightPanelRoot(panelHost) {
+  return panelHost?.closest?.('[data-app-shell-focus-area="right-panel"]') || panelHost;
+}
+
+function clearActiveCustomPanelFlag(panelHost) {
+  const root = rightPanelRoot(panelHost);
+  clearBodyActiveCustomPanelFlag();
+  if (root instanceof HTMLElement && root.hasAttribute(ACTIVE_CUSTOM_PANEL_ATTR)) {
+    root.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
+  }
+  const hosts = new Set();
+  if (panelHost instanceof HTMLElement) hosts.add(panelHost);
+  if (root instanceof HTMLElement) {
+    for (const host of root.querySelectorAll(`[${CUSTOM_PANEL_HOST_ATTR}]`)) {
+      if (host instanceof HTMLElement) hosts.add(host);
+    }
+  }
+  for (const host of hosts) {
+    if (host.hasAttribute(CUSTOM_PANEL_HOST_ATTR)) host.removeAttribute(CUSTOM_PANEL_HOST_ATTR);
+    if (host.hasAttribute(ACTIVE_CUSTOM_PANEL_ATTR)) {
+      host.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
+    }
+  }
+}
+
+function setActiveCustomPanelFlag(panelHost, activeAttr) {
+  const root = rightPanelRoot(panelHost);
+  setBodyActiveCustomPanelFlag(activeAttr);
+  if (
+    root instanceof HTMLElement &&
+    root.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr
+  ) {
+    root.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+  if (panelHost.getAttribute(CUSTOM_PANEL_HOST_ATTR) !== "true") {
+    panelHost.setAttribute(CUSTOM_PANEL_HOST_ATTR, "true");
+  }
+  if (panelHost.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr) {
+    panelHost.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+}
+
+function setBodyActiveCustomPanelFlag(activeAttr) {
+  if (!(document.body instanceof HTMLElement)) return;
+  if (document.body.getAttribute(ACTIVE_CUSTOM_PANEL_ATTR) !== activeAttr) {
+    document.body.setAttribute(ACTIVE_CUSTOM_PANEL_ATTR, activeAttr);
+  }
+}
+
+function clearBodyActiveCustomPanelFlag() {
+  if (document.body instanceof HTMLElement) {
+    document.body.removeAttribute(ACTIVE_CUSTOM_PANEL_ATTR);
+  }
+}
+
+function selectedCustomTab(root) {
+  for (const tab of root.querySelectorAll(customTabSelector())) {
+    if (!(tab instanceof HTMLElement)) continue;
+    const roleTab = tab.querySelector('[role="tab"]');
+    if (tab.getAttribute("data-selected") === "true" || roleTab?.getAttribute("aria-selected") === "true") {
+      return tab;
+    }
+  }
+  return null;
+}
+
+function reconcileActiveCustomPanelFromDom() {
+  const tablist = findRightTablist();
+  const panelHost =
+    tablist instanceof HTMLElement ? findPanelHostForTablist(tablist) : null;
+  if (panelHost instanceof HTMLElement) reconcileActiveCustomPanel(panelHost);
+}
+
+function scheduleCustomPanelReconcile(panelHost) {
+  for (const delay of [0, 50, 150, 500]) {
+    setTimeout(() => reconcileActiveCustomPanel(panelHost), delay);
+  }
+}
+
+function reconcileActiveCustomPanel(panelHost) {
+  const root = rightPanelRoot(panelHost);
+  if (!(root instanceof HTMLElement)) return false;
+  const activeTab = selectedCustomTab(root);
+  if (!(activeTab instanceof HTMLElement)) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+  const activeAttr = CUSTOM_PANEL_ATTRS.find((attr) => activeTab.getAttribute(attr) === "side-tab");
+  if (!activeAttr) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+  const activePanel = root.querySelector(`[${activeAttr}="tabpanel"]`);
+  if (!(activePanel instanceof HTMLElement)) {
+    clearActiveCustomPanelFlag(panelHost);
+    return false;
+  }
+
+  setActiveCustomPanelFlag(panelHost, activeAttr);
+  for (const panel of Array.from(panelHost.children)) {
+    if (!(panel instanceof HTMLElement) || panel === activePanel) continue;
+    if (panel.matches(".h-toolbar, [role='status']")) continue;
+    if (isCustomPanel(panel)) {
+      if (panel.style.display !== "none") panel.style.display = "none";
+      detachPanelCapture(panel);
+      continue;
+    }
+    if (!panel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
+      panel.setAttribute(
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(panel) ?? panel.style.display ?? "",
+      );
+    }
+    clearLegacyPanelDisplayAttrs(panel);
+    if (panel.style.display !== "none") panel.style.display = "none";
+  }
+  for (const panel of root.querySelectorAll('[role="tabpanel"]')) {
+    if (!(panel instanceof HTMLElement) || panel === activePanel) continue;
+    if (isCustomPanel(panel)) {
+      if (panel.style.display !== "none") panel.style.display = "none";
+      detachPanelCapture(panel);
+      continue;
+    }
+    if (!panel.hasAttribute(CUSTOM_PANEL_PREV_DISPLAY_ATTR)) {
+      panel.setAttribute(
+        CUSTOM_PANEL_PREV_DISPLAY_ATTR,
+        legacyPanelDisplayValue(panel) ?? panel.style.display ?? "",
+      );
+    }
+    clearLegacyPanelDisplayAttrs(panel);
+    if (panel.style.display !== "none") panel.style.display = "none";
+  }
+  if (activePanel.style.display !== "") activePanel.style.display = "";
+  return true;
+}
+
+function deactivateNativeBrowserSurface(panelHost) {
+  setBodyActiveCustomPanelFlag(TWEAK_ATTR);
 }
 
 function removeEmuPanel() {
