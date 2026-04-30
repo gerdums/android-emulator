@@ -6,7 +6,7 @@
  * - Native-looking right-panel tab + panel, parallel-injected like the iOS
  *   simulator tweak.
  * - Headless emulator launch through the Android SDK emulator.
- * - Low-latency frame capture through `screenrecord` piped through ffmpeg.
+ * - Low-latency emulator capture through the emulator console screenshot API.
  * - Pointer input through a persistent `adb shell` so taps/drags do not pay
  *   an adb process startup cost per event.
  */
@@ -120,6 +120,7 @@ function registerMainHandlers(api, tweak) {
   const electron = require("electron");
   const { ipcMain, webContents } = electron;
   const fs = require("node:fs");
+  const net = require("node:net");
   const os = require("node:os");
   const path = require("node:path");
 
@@ -151,9 +152,18 @@ function registerMainHandlers(api, tweak) {
     captureBusy: false,
     screenrecordProc: null,
     ffmpegProc: null,
+    screencapProc: null,
+    screenshotTimer: null,
+    screenshotBusy: false,
+    screenshotDir: null,
+    captureConsole: null,
+    captureConsoleSerial: null,
+    inputConsole: null,
+    inputConsoleSerial: null,
     captureRestartTimer: null,
     captureStopping: false,
     jpegBuffer: Buffer.alloc(0),
+    pngBuffer: Buffer.alloc(0),
     lastFrameSentAt: 0,
     lastMeta: null,
     lastError: null,
@@ -209,6 +219,155 @@ function registerMainHandlers(api, tweak) {
 
   function sendStatus(payload) {
     broadcast(STATUS_CHANNEL, payload);
+  }
+
+  function emulatorConsolePort(serial) {
+    const match = String(serial || "").match(/^emulator-(\d+)$/);
+    return match ? Number(match[1]) : null;
+  }
+
+  function emulatorConsoleAuthToken() {
+    try {
+      return fs.readFileSync(path.join(os.homedir(), ".emulator_console_auth_token"), "utf8").trim();
+    } catch {
+      return "";
+    }
+  }
+
+  function createConsoleClient(serial, label) {
+    const port = emulatorConsolePort(serial);
+    const token = emulatorConsoleAuthToken();
+    const client = {
+      socket: null,
+      ready: null,
+      buffer: "",
+      queue: [],
+      closed: false,
+    };
+
+    const close = () => {
+      client.closed = true;
+      for (const item of client.queue.splice(0)) {
+        clearTimeout(item.timer);
+        item.resolve({ ok: false, error: `${label} console closed` });
+      }
+      if (client.socket && !client.socket.destroyed) {
+        try {
+          client.socket.end("quit\n");
+        } catch {}
+        try {
+          client.socket.destroy();
+        } catch {}
+      }
+      client.socket = null;
+      client.ready = null;
+    };
+
+    const processBuffer = () => {
+      if (!client.socket || client.closed) return;
+      if (/Authentication required/i.test(client.buffer)) {
+        if (!token) {
+          close();
+          return;
+        }
+        client.buffer = "";
+        client.socket.write(`auth ${token}\n`);
+        return;
+      }
+      if (client.ready?.resolve && /OK\r?\n/.test(client.buffer)) {
+        const resolve = client.ready.resolve;
+        clearTimeout(client.ready.timer);
+        client.ready.resolve = null;
+        client.buffer = "";
+        resolve({ ok: true });
+        return;
+      }
+      if (client.queue.length && /(OK|KO:.*)\r?\n/.test(client.buffer)) {
+        const item = client.queue.shift();
+        clearTimeout(item.timer);
+        const text = client.buffer.trim();
+        client.buffer = "";
+        item.resolve(/^OK\b/.test(text) ? { ok: true, text } : { ok: false, error: text });
+      }
+    };
+
+    const connect = () => {
+      if (!port) return Promise.resolve({ ok: false, error: `Not an emulator serial: ${serial}` });
+      if (client.socket && !client.socket.destroyed && client.ready && !client.ready.resolve) {
+        return Promise.resolve({ ok: true });
+      }
+      if (client.ready?.promise) return client.ready.promise;
+
+      client.closed = false;
+      client.buffer = "";
+      client.socket = net.createConnection(port, "127.0.0.1");
+      client.socket.setEncoding("utf8");
+      const ready = {};
+      ready.promise = new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          close();
+          resolve({ ok: false, error: `${label} console connect timed out` });
+        }, 2_000);
+        ready.resolve = resolve;
+        ready.timer = timer;
+      });
+      client.ready = ready;
+      client.socket.on("data", (chunk) => {
+        client.buffer += chunk;
+        processBuffer();
+      });
+      client.socket.on("error", (e) => {
+        api.log?.warn?.(`android-emu ${label} console error`, String(e));
+        close();
+      });
+      client.socket.on("close", () => {
+        if (!client.closed) close();
+      });
+      return client.ready.promise;
+    };
+
+    const command = async (commandText, timeoutMs = 1_500) => {
+      const ready = await connect();
+      if (!ready.ok) return ready;
+      return new Promise((resolve) => {
+        const item = {
+          resolve,
+          timer: setTimeout(() => {
+            const idx = client.queue.indexOf(item);
+            if (idx >= 0) client.queue.splice(idx, 1);
+            resolve({ ok: false, error: `${label} console command timed out` });
+          }, timeoutMs),
+        };
+        client.queue.push(item);
+        try {
+          client.socket.write(commandText + "\n");
+        } catch (e) {
+          clearTimeout(item.timer);
+          client.queue.pop();
+          resolve({ ok: false, error: String(e) });
+        }
+      });
+    };
+
+    return { command, close };
+  }
+
+  function getCaptureConsole(serial) {
+    if (!state.captureConsole || state.captureConsoleSerial !== serial) {
+      state.captureConsole?.close?.();
+      state.captureConsole = createConsoleClient(serial, "capture");
+      state.captureConsoleSerial = serial;
+    }
+    return state.captureConsole;
+  }
+
+  function getInputConsole(serial) {
+    if (!state.inputConsole || state.inputConsoleSerial !== serial) {
+      state.inputConsole?.close?.();
+      state.inputConsole = createConsoleClient(serial, "input");
+      state.inputConsoleSerial = serial;
+    }
+    return state.inputConsole;
   }
 
   function run(command, args, opts = {}) {
@@ -526,6 +685,181 @@ function registerMainHandlers(api, tweak) {
     }
   }
 
+  function processPngStream(chunk) {
+    state.pngBuffer = state.pngBuffer.length ? Buffer.concat([state.pngBuffer, chunk]) : chunk;
+    for (;;) {
+      let start = -1;
+      for (let i = 0; i < state.pngBuffer.length - 7; i += 1) {
+        if (
+          state.pngBuffer[i] === 0x89 &&
+          state.pngBuffer[i + 1] === 0x50 &&
+          state.pngBuffer[i + 2] === 0x4e &&
+          state.pngBuffer[i + 3] === 0x47
+        ) {
+          start = i;
+          break;
+        }
+      }
+      if (start < 0) {
+        if (state.pngBuffer.length > 1_000_000) state.pngBuffer = Buffer.alloc(0);
+        return;
+      }
+      if (start > 0) state.pngBuffer = state.pngBuffer.subarray(start);
+      let end = -1;
+      for (let i = 8; i < state.pngBuffer.length - 7; i += 1) {
+        if (
+          state.pngBuffer[i] === 0x49 &&
+          state.pngBuffer[i + 1] === 0x45 &&
+          state.pngBuffer[i + 2] === 0x4e &&
+          state.pngBuffer[i + 3] === 0x44 &&
+          state.pngBuffer[i + 4] === 0xae &&
+          state.pngBuffer[i + 5] === 0x42 &&
+          state.pngBuffer[i + 6] === 0x60 &&
+          state.pngBuffer[i + 7] === 0x82
+        ) {
+          end = i + 8;
+          break;
+        }
+      }
+      if (end < 0) {
+        if (state.pngBuffer.length > 10_000_000) state.pngBuffer = Buffer.alloc(0);
+        return;
+      }
+      const frame = Buffer.from(state.pngBuffer.subarray(0, end));
+      state.pngBuffer = state.pngBuffer.subarray(end);
+      const now = Date.now();
+      if (now - state.lastFrameSentAt < 65) continue;
+      state.lastFrameSentAt = now;
+      broadcast(FRAME_CHANNEL, frame);
+    }
+  }
+
+  function screenshotDirForSerial(serial) {
+    const safe = String(serial || "android").replace(/[^A-Za-z0-9_.-]/g, "_");
+    const dir = path.join(os.tmpdir(), "codexpp-android-emulator", safe);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  function latestPng(dir) {
+    let latest = null;
+    for (const name of fs.readdirSync(dir)) {
+      if (!/\.png$/i.test(name)) continue;
+      const full = path.join(dir, name);
+      let st;
+      try {
+        st = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (!latest || st.mtimeMs > latest.mtimeMs) latest = { full, mtimeMs: st.mtimeMs };
+    }
+    return latest?.full || null;
+  }
+
+  function cleanupScreenshotDir(dir, keepPath) {
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        if (full !== keepPath && /\.png$/i.test(name)) fs.rmSync(full, { force: true });
+      }
+    } catch {}
+  }
+
+  async function captureConsoleScreenshotOnce(serial) {
+    if (!state.screenshotDir) state.screenshotDir = screenshotDirForSerial(serial);
+    const consoleClient = getCaptureConsole(serial);
+    let r = await consoleClient.command(`screenrecord screenshot ${state.screenshotDir}`, 1_500);
+    if (!r.ok) {
+      r = await run(adbPath, ["-s", serial, "emu", "screenrecord", "screenshot", state.screenshotDir], {
+        timeoutMs: 1_500,
+      });
+    }
+    if (!r.ok) {
+      const error = r.stderr || r.error || "emulator screenshot failed";
+      if (state.lastError !== error) {
+        state.lastError = error;
+        sendStatus({ kind: "error", error });
+      }
+      return false;
+    }
+    const file = latestPng(state.screenshotDir);
+    if (!file) return false;
+    const png = fs.readFileSync(file);
+    state.lastError = null;
+    broadcast(FRAME_CHANNEL, png);
+    cleanupScreenshotDir(state.screenshotDir, file);
+    return true;
+  }
+
+  async function startConsoleScreenshotCapture(serial) {
+    state.serial = serial;
+    state.captureMode = "emulator-screenshot";
+    state.screenshotDir = screenshotDirForSerial(serial);
+    state.lastFrameSentAt = 0;
+    const size = await getDisplaySize(serial).catch(() => ({ width: 1080, height: 2400 }));
+    state.lastMeta = { serial, width: size.width, height: size.height, mode: "emulator-screenshot" };
+    broadcast(META_CHANNEL, state.lastMeta);
+    sendStatus({ kind: "starting", message: "Starting emulator screenshot stream..." });
+
+    const tick = async () => {
+      if (state.captureMode !== "emulator-screenshot" || state.captureStopping) return;
+      const started = Date.now();
+      if (!state.screenshotBusy) {
+        state.screenshotBusy = true;
+        try {
+          await captureConsoleScreenshotOnce(serial);
+        } catch (e) {
+          sendStatus({ kind: "error", error: String(e) });
+        } finally {
+          state.screenshotBusy = false;
+        }
+      }
+      if (state.captureMode !== "emulator-screenshot" || state.captureStopping) return;
+      const elapsed = Date.now() - started;
+      state.screenshotTimer = setTimeout(tick, Math.max(1, 75 - elapsed));
+      state.screenshotTimer.unref?.();
+    };
+    tick();
+    return { ok: true, status: "started", mode: "emulator-screenshot", serial };
+  }
+
+  async function startScreencapLoopCapture(serial, reason) {
+    state.serial = serial;
+    state.captureMode = "screencap-loop";
+    state.pngBuffer = Buffer.alloc(0);
+    state.lastFrameSentAt = 0;
+    const size = await getDisplaySize(serial).catch(() => ({ width: 1080, height: 2400 }));
+    state.lastMeta = { serial, width: size.width, height: size.height, mode: "screencap-loop" };
+    broadcast(META_CHANNEL, state.lastMeta);
+    sendStatus({
+      kind: "starting",
+      message: reason ? "Falling back to adb screencap stream..." : "Starting Android capture...",
+    });
+
+    const proc = spawn(adbPath, ["-s", serial, "exec-out", "sh", "-c", "while true; do screencap -p; done"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    state.screencapProc = proc;
+    proc.stdout.on("data", processPngStream);
+    proc.stderr.on("data", (b) => {
+      const line = b.toString("utf8").trim();
+      if (line) api.log?.info?.("[android-screencap]", line);
+    });
+    proc.on("error", (e) => {
+      if (state.captureStopping) return;
+      sendStatus({ kind: "error", error: String(e) });
+    });
+    proc.on("exit", (code, signal) => {
+      if (state.captureStopping || state.captureMode !== "screencap-loop") return;
+      sendStatus({ kind: "stopped", reason: `screencap exited ${code ?? signal ?? ""}`.trim() });
+      state.screencapProc = null;
+      state.captureMode = null;
+    });
+    return { ok: true, status: "started", mode: "screencap-loop", serial };
+  }
+
   async function startStreamCapture(serial) {
     const size = await getDisplaySize(serial).catch(() => ({ width: 1080, height: 2400 }));
     const streamSize = targetStreamSize(size);
@@ -679,17 +1013,40 @@ function registerMainHandlers(api, tweak) {
     if (state.captureMode === "screenrecord" && state.screenrecordProc && state.ffmpegProc) {
       return { ok: true, status: "already-running", mode: "screenrecord", serial: state.serial };
     }
+    if (state.captureMode === "emulator-screenshot") {
+      return { ok: true, status: "already-running", mode: "emulator-screenshot", serial: state.serial };
+    }
+    if (state.captureMode === "screencap-loop" && state.screencapProc) {
+      return { ok: true, status: "already-running", mode: "screencap-loop", serial: state.serial };
+    }
     if (state.captureTimer) {
       return { ok: true, status: "already-running", mode: "polling", serial: state.serial };
     }
-    if (/^emulator-\d+$/.test(state.serial) && ffmpegPath && ffmpegPath !== "ffmpeg") {
-      return startStreamCapture(state.serial);
+    if (/^emulator-\d+$/.test(state.serial)) {
+      return startConsoleScreenshotCapture(state.serial);
     }
-    return startPollingCapture(state.serial);
+    return startScreencapLoopCapture(state.serial);
   }
 
   function stopCapture(reason) {
     stopStreamCapture();
+    state.captureConsole?.close?.();
+    state.captureConsole = null;
+    state.captureConsoleSerial = null;
+    if (state.screencapProc && !state.screencapProc.killed) {
+      try {
+        state.screencapProc.removeAllListeners("exit");
+        state.screencapProc.removeAllListeners("error");
+        state.screencapProc.kill("SIGTERM");
+      } catch {}
+    }
+    state.screencapProc = null;
+    state.pngBuffer = Buffer.alloc(0);
+    if (state.screenshotTimer) {
+      clearTimeout(state.screenshotTimer);
+      state.screenshotTimer = null;
+    }
+    state.screenshotBusy = false;
     if (state.captureTimer) {
       clearInterval(state.captureTimer);
       state.captureTimer = null;
@@ -706,6 +1063,9 @@ function registerMainHandlers(api, tweak) {
     }
     state.pendingMove = null;
     state.touch = null;
+    state.inputConsole?.close?.();
+    state.inputConsole = null;
+    state.inputConsoleSerial = null;
     const proc = state.inputShellProc;
     state.inputShellProc = null;
     state.inputShellSerial = null;
@@ -773,9 +1133,19 @@ function registerMainHandlers(api, tweak) {
       const pending = state.pendingMove;
       state.pendingMove = null;
       if (pending && state.touch) {
-        sendMoveSegment(serial, pending).catch((e) =>
-          api.log?.warn?.("android-emu pending move failed", String(e)),
-        );
+        if (/^emulator-\d+$/.test(serial)) {
+          state.touch.last = pending;
+          state.touch.lastSent = pending;
+          state.touch.lastMoveAt = Date.now();
+          state.touch.moved = true;
+          sendEmulatorMouse(serial, pending, true).catch((e) =>
+            api.log?.warn?.("android-emu pending mouse failed", String(e)),
+          );
+        } else {
+          sendMoveSegment(serial, pending).catch((e) =>
+            api.log?.warn?.("android-emu pending move failed", String(e)),
+          );
+        }
       }
     }, 35);
     state.inputMoveTimer.unref?.();
@@ -798,6 +1168,47 @@ function registerMainHandlers(api, tweak) {
     return runShellInput(serial, ["swipe", from.x, from.y, point.x, point.y, 45]);
   }
 
+  async function sendEmulatorMouse(serial, point, pressed) {
+    const result = await getInputConsole(serial).command(
+      `event mouse ${point.x} ${point.y} 0 ${pressed ? 1 : 0}`,
+      500,
+    );
+    return result.ok ? result : runShellInput(serial, ["tap", point.x, point.y]);
+  }
+
+  async function handleEmulatorTouch(serial, event, point) {
+    const now = Date.now();
+    if (event.phase === "down") {
+      state.touch = { start: point, last: point, lastSent: point, lastMoveAt: now, moved: false };
+      state.pendingMove = null;
+      return sendEmulatorMouse(serial, point, true);
+    }
+    if (event.phase === "move") {
+      if (!state.touch) return { ok: true };
+      if (pointDistance(state.touch.lastSent, point) < 4) return { ok: true };
+      if (now - (state.touch.lastMoveAt || 0) < 24) {
+        state.pendingMove = point;
+        schedulePendingMove(serial);
+        return { ok: true, throttled: true };
+      }
+      state.touch.last = point;
+      state.touch.lastSent = point;
+      state.touch.lastMoveAt = now;
+      state.touch.moved = true;
+      return sendEmulatorMouse(serial, point, true);
+    }
+    if (event.phase === "up") {
+      state.touch = null;
+      state.pendingMove = null;
+      if (state.inputMoveTimer) {
+        clearTimeout(state.inputMoveTimer);
+        state.inputMoveTimer = null;
+      }
+      return sendEmulatorMouse(serial, point, false);
+    }
+    return { ok: true };
+  }
+
   ipcMain.handle(ch("android-emu:input:event"), async (_evt, event) => {
     const serial = state.serial;
     if (!serial) return { ok: false, error: "No active Android target" };
@@ -817,6 +1228,10 @@ function registerMainHandlers(api, tweak) {
       y: Math.max(0, Math.min(size.height - 1, Math.round(Number(event.y) * size.height))),
       at: Date.now(),
     };
+
+    if (/^emulator-\d+$/.test(serial)) {
+      return handleEmulatorTouch(serial, event, point);
+    }
 
     if (event.phase === "down") {
       state.touch = { start: point, last: point, lastSent: point, lastMoveAt: 0, moved: false };
